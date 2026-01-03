@@ -9,6 +9,7 @@ import glob
 import time
 import threading
 import argparse
+from tkinter import image_names
 from typing import List, Optional
 
 import numpy as np
@@ -18,6 +19,12 @@ import viser
 import viser.transforms as viser_tf
 import cv2
 
+# VSLAMLAB
+import webbrowser
+from scipy.spatial.transform import Rotation as R
+import pandas as pd
+import csv
+from pathlib import Path
 
 try:
     import onnxruntime
@@ -38,7 +45,8 @@ def viser_wrapper(
     use_point_map: bool = False,
     background_mode: bool = False,
     mask_sky: bool = False,
-    image_folder: str = None,
+    sequence_path: str = None,
+    rgb_csv: str = None,
 ):
     """
     Visualize predicted 3D points and camera poses with viser.
@@ -59,12 +67,15 @@ def viser_wrapper(
         use_point_map (bool): Whether to visualize world_points or use depth-based points.
         background_mode (bool): Whether to run the server in background thread.
         mask_sky (bool): Whether to apply sky segmentation to filter out sky points.
-        image_folder (str): Path to the folder containing input images.
+        sequence_path (str): Path to the sequence folder containing input images.
+        rgb_csv (str): Path to the CSV file containing RGB image information.
     """
     print(f"Starting viser server on port {port}")
 
     server = viser.ViserServer(host="0.0.0.0", port=port)
     server.gui.configure_theme(titlebar_content=None, control_layout="collapsible")
+    had_clients = False
+    stop_event = threading.Event()
 
     # Unpack prediction dict
     images = pred_dict["images"]  # (S, 3, H, W)
@@ -86,8 +97,8 @@ def viser_wrapper(
         conf = conf_map
 
     # Apply sky segmentation if enabled
-    if mask_sky and image_folder is not None:
-        conf = apply_sky_segmentation(conf, image_folder)
+    if mask_sky and rgb_csv is not None:
+        conf = apply_sky_segmentation(conf, sequence_path, rgb_csv)
 
     # Convert images from (S, 3, H, W) to (S, H, W, 3)
     # Then flatten everything for the point cloud
@@ -236,18 +247,28 @@ def viser_wrapper(
     visualize_frames(cam_to_world, images)
 
     print("Starting viser server...")
-    # If background_mode is True, spawn a daemon thread so the main thread can continue.
+    webbrowser.open(f"http://localhost:{port}")
+
+    def server_loop():
+        nonlocal had_clients
+        while not stop_event.is_set():
+            num_clients = len(server.get_clients())
+            if num_clients > 0:
+                had_clients = True
+            if had_clients and num_clients == 0:
+                print("(viser) All clients disconnected. Shutting down server.")
+                stop_event.set()
+                break
+            time.sleep(0.1)
+
     if background_mode:
-
-        def server_loop():
-            while True:
-                time.sleep(0.001)
-
         thread = threading.Thread(target=server_loop, daemon=True)
         thread.start()
     else:
-        while True:
-            time.sleep(0.01)
+        try:
+            server_loop()
+        except KeyboardInterrupt:
+            stop_event.set()
 
     return server
 
@@ -255,19 +276,20 @@ def viser_wrapper(
 # Helper functions for sky segmentation
 
 
-def apply_sky_segmentation(conf: np.ndarray, image_folder: str) -> np.ndarray:
+def apply_sky_segmentation(conf: np.ndarray, sequence_path: str, rgb_csv: str) -> np.ndarray:
     """
     Apply sky segmentation to confidence scores.
 
     Args:
         conf (np.ndarray): Confidence scores with shape (S, H, W)
-        image_folder (str): Path to the folder containing input images
+        sequence_path (str): Path to the sequence folder containing input images
+        rgb_csv (str): Path to the CSV file containing RGB image information
 
     Returns:
         np.ndarray: Updated confidence scores with sky regions masked out
     """
     S, H, W = conf.shape
-    sky_masks_dir = image_folder.rstrip("/") + "_sky_masks"
+    sky_masks_dir = os.path.join(sequence_path, 'sky_masks')
     os.makedirs(sky_masks_dir, exist_ok=True)
 
     # Download skyseg.onnx if it doesn't exist
@@ -276,7 +298,14 @@ def apply_sky_segmentation(conf: np.ndarray, image_folder: str) -> np.ndarray:
         download_file_from_url("https://huggingface.co/JianyuanWang/skyseg/resolve/main/skyseg.onnx", "skyseg.onnx")
 
     skyseg_session = onnxruntime.InferenceSession("skyseg.onnx")
-    image_files = sorted(glob.glob(os.path.join(image_folder, "*")))
+
+    df = pd.read_csv(rgb_csv)       
+    cam_name = "rgb_0"
+    image_list = df[f'path_{cam_name}'].to_list()
+    image_files = []
+    for imrel in image_list:
+        image_files.append(sequence_path + '/' + imrel)
+
     sky_mask_list = []
 
     print("Generating sky masks...")
@@ -304,11 +333,16 @@ def apply_sky_segmentation(conf: np.ndarray, image_folder: str) -> np.ndarray:
     print("Sky segmentation applied successfully")
     return conf
 
-
 parser = argparse.ArgumentParser(description="VGGT demo with viser for 3D visualization")
-parser.add_argument(
-    "--image_folder", type=str, default="examples/kitchen/images/", help="Path to folder containing images"
-)
+
+parser.add_argument("--sequence_path", type=str, help="path to image directory")
+parser.add_argument("--calibration_yaml", type=str, help="path to calibration file")
+parser.add_argument("--rgb_csv", type=str, help="path to image list")
+parser.add_argument("--exp_folder", type=str, help="path to save results")
+parser.add_argument("--exp_it", type=str, help="experiment iteration")
+parser.add_argument("--settings_yaml", type=str, help="settings_yaml")
+parser.add_argument("--verbose", type=str, help="verbose")
+
 parser.add_argument("--use_point_map", action="store_true", help="Use point map instead of depth-based points")
 parser.add_argument("--background_mode", action="store_true", help="Run the viser server in background mode")
 parser.add_argument("--port", type=int, default=8080, help="Port number for the viser server")
@@ -337,7 +371,7 @@ def main():
     --conf_threshold: Initial percentage of low-confidence points to filter out
     --mask_sky: Apply sky segmentation to filter out sky points
     """
-    args = parser.parse_args()
+    args, _ = parser.parse_known_args()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
 
@@ -352,8 +386,15 @@ def main():
     model = model.to(device)
 
     # Use the provided image folder path
-    print(f"Loading images from {args.image_folder}...")
-    image_names = glob.glob(os.path.join(args.image_folder, "*"))
+    print(f"Loading images from {args.sequence_path}...")
+    df = pd.read_csv(args.rgb_csv)       
+    cam_name = "rgb_0"
+    image_list = df[f'path_{cam_name}'].to_list()
+    ts_ns = df[f'ts_{cam_name} (ns)']
+    image_names = []
+    for imrel in image_list:
+        image_names.append(args.sequence_path + '/' + imrel)
+
     print(f"Found {len(image_names)} images")
 
     images = load_and_preprocess_images(image_names).to(device)
@@ -384,18 +425,36 @@ def main():
     if args.mask_sky:
         print("Sky segmentation enabled - will filter out sky points")
 
-    print("Starting viser visualization...")
+    keyframe_csv = Path(args.exp_folder) / f"{args.exp_it.zfill(5)}_KeyFrameTrajectory.csv"
+    R_matrices = extrinsic[0, :, :, :3]  
+    t = extrinsic[0, :, :, 3]   
+    R_np =  R_matrices.cpu().numpy()
+    rot = R.from_matrix(R_np)  
+    quaternions = rot.as_quat() 
 
-    viser_server = viser_wrapper(
-        predictions,
-        port=args.port,
-        init_conf_threshold=args.conf_threshold,
-        use_point_map=args.use_point_map,
-        background_mode=args.background_mode,
-        mask_sky=args.mask_sky,
-        image_folder=args.image_folder,
-    )
-    print("Visualization complete")
+    with open(keyframe_csv, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["ts (ns)", "tx (m)", "ty (m)", "tz (m)", "qx", "qy", "qz", "qw"])
+        for i_pose, q in enumerate(quaternions):
+            tx, ty, tz = t[i_pose].cpu().numpy()
+            qx, qy, qz, qw = q
+            writer.writerow([ts_ns[i_pose], tx, ty, tz, qx, qy, qz, qw])
+
+    verbose = bool(int(args.verbose))
+    if verbose:
+        print("Starting viser visualization...")
+
+        viser_server = viser_wrapper(
+            predictions,
+            port=args.port,
+            init_conf_threshold=args.conf_threshold,
+            use_point_map=args.use_point_map,
+            background_mode=args.background_mode,
+            mask_sky=args.mask_sky,
+            sequence_path=args.sequence_path,
+            rgb_csv=args.rgb_csv,
+        )
+        print("Visualization complete")
 
 
 if __name__ == "__main__":
